@@ -1,0 +1,20 @@
+[project]
+name = "anki-parser"
+version = "0.1.0"
+description = "PDF (Hebrew exam recoveries) → Anki .apkg deck"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pymupdf>=1.24.0",
+    "genanki>=0.13.1",
+    "streamlit>=1.36.0",
+    "Pillow>=10.0.0",
+    "streamlit-sortables>=0.3.0",
+    "google-genai>=0.3.0",
+]
+
+[project.scripts]
+anki-parser = "cli:main"
+
+[tool.uv]
+dev-dependencies = ["pytest>=8.0"]

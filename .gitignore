@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Playwright
+.playwright-mcp/
+
+# Generated output
+*.apkg
+media/
+
+# Screenshots (dev artefacts)
+*.png
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
