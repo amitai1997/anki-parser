@@ -12,6 +12,7 @@ Strategy:
 from __future__ import annotations
 
 import html as html_lib
+import random
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -35,7 +36,7 @@ OPTION_RE = re.compile(r"(?P<lead>(?:^|\n))\s*(?P<n>[1-5])\s*\.\s*(?:\n|$)")
 HEB_LETTER_TO_ASCII = {"א": "a", "ב": "b"}
 
 # Regexes for alternate formats
-BOOKLET_Q_RE = re.compile(r":(\d+)\s+שאלה\s+מספר")
+BOOKLET_Q_RE = re.compile(r"שאלה\s+מספר\s+(\d+)\s*:")
 BOOKLET_OPT_RE = re.compile(r"(?m)^\s*\.([1-5])\s*$")
 
 BOLD_FLAG = 16
@@ -140,8 +141,76 @@ def _detect_sections(doc: pymupdf.Document) -> list[Section]:
 
 # ---------- Text/span stream ----------
 
+
+def _reorder_rtl_line(
+    items: list[tuple[dict, str]],
+) -> list[tuple[dict, str]]:
+    """Reorder span items in a Hebrew (RTL) line into logical reading order.
+
+    PyMuPDF emits spans in x-ascending (visual stream) order. For an RTL
+    paragraph the reading order is the reverse — except that LTR runs (Latin
+    words, digits, punctuation) read left-to-right within themselves, so they
+    must keep their stream order even though the macro order flips.
+
+    We group consecutive non-Hebrew items (with the whitespace between them)
+    into a single LTR macro token, then reverse the macro-token order. Hebrew
+    words and standalone whitespace each form their own macro token.
+    """
+    if not items:
+        return []
+    classified: list[tuple[str, dict, str]] = []
+    for span, t in items:
+        if not t.strip():
+            kind = "ws"
+        elif _HEB_RE.search(t):
+            kind = "heb"
+        else:
+            kind = "ltr"
+        classified.append((kind, span, t))
+
+    macros: list[list[tuple[dict, str]]] = []
+    i = 0
+    n = len(classified)
+    while i < n:
+        kind, span, t = classified[i]
+        if kind in ("heb", "ws"):
+            macros.append([(span, t)])
+            i += 1
+            continue
+        # kind == "ltr": absorb following ltr items and interior whitespace
+        run: list[tuple[dict, str]] = [(span, t)]
+        j = i + 1
+        while j < n:
+            k_kind = classified[j][0]
+            if k_kind == "ltr":
+                run.append((classified[j][1], classified[j][2]))
+                j += 1
+                continue
+            if k_kind == "ws":
+                k = j + 1
+                while k < n and classified[k][0] == "ws":
+                    k += 1
+                if k < n and classified[k][0] == "ltr":
+                    for kk in range(j, k + 1):
+                        run.append((classified[kk][1], classified[kk][2]))
+                    j = k + 1
+                    continue
+            break
+        macros.append(run)
+        i = j
+
+    macros.reverse()
+    out: list[tuple[dict, str]] = []
+    for m in macros:
+        out.extend(m)
+    return out
+
+
 def _build_text_stream(
-    doc: pymupdf.Document, start_page: int, end_page: int
+    doc: pymupdf.Document,
+    start_page: int,
+    end_page: int,
+    bidi_correct: bool = False,
 ) -> tuple[str, list[Span]]:
     """Walk pages, returning ``(plain_text, spans)`` where each span has
     ``start``/``end`` offsets into ``plain_text``."""
@@ -167,6 +236,7 @@ def _build_text_stream(
                 raw_lines = raw_block.get("lines") or []
                 raw_line = raw_lines[l_idx] if l_idx < len(raw_lines) else {}
                 raw_spans = raw_line.get("spans") or []
+                line_items: list[tuple[dict, str]] = []
                 for s_idx, span in enumerate(line.get("spans", [])):
                     t = span.get("text", "")
                     if not t:
@@ -178,8 +248,18 @@ def _build_text_stream(
                         reordered = _chars_to_text(raw_chars)
                         if len(reordered) == len(t):
                             t = reordered
-                    if not t:
-                        continue
+                    if t:
+                        line_items.append((span, t))
+                # PyMuPDF emits spans in x-ascending (visual stream) order. For RTL
+                # lines containing Hebrew, the logical reading order is x-descending,
+                # so a multi-span line like "Heb1 LTR Heb2" comes out reversed unless
+                # we re-sort. Pure-LTR lines are left untouched.
+                if any(_HEB_RE.search(t) for _, t in line_items):
+                    if bidi_correct:
+                        line_items = _reorder_rtl_line(line_items)
+                    else:
+                        line_items.sort(key=lambda it: -it[0].get("bbox", (0, 0, 0, 0))[0])
+                for span, t in line_items:
                     spans.append(
                         Span(
                             text=t,
@@ -820,30 +900,32 @@ def _is_huji_metadata(line: str) -> bool:
     l = line.strip()
     if not l:
         return True
-    if re.match(r"^\d+\s+שאלה$", l):
+    if re.match(r"^שאלה\s+\d+$", l):
         return True
     if l in ("תקין", "שגוי", "לענות", "מצב", "הסתיים", "/"):
         return True
-    if re.match(r"^מתוך נקודות", l):
+    if "נקודות מתוך" in l:
         return True
     if re.match(r"^\d+\.\d+$", l):
         return True
     if re.match(r"^\d+/\d+$", l):
         return True
-    if "קורס מספר" in l:
+    if "מספר קורס" in l:
         return True
     if l.startswith("http"):
         return True
     if re.search(r"AM\s+\d+:\d+", l):
         return True
-    if re.search(r"ציונים\d", l) or l.startswith("ציונים") or l.startswith("וציונים"):
+    if l.startswith("התחיל ב") or l.startswith("הושלם ב"):
         return True
-    if "שלקח הזמן" in l or "ניסיון סקירת" in l:
+    if "ציונים" in l or "ציון מירבי" in l:
         return True
-    if l.startswith("ראשי/") or l.startswith("/יחידות") or re.match(r"^Topic \d+$", l):
+    if "הזמן שלקח" in l or "סקירת ניסיון" in l:
         return True
-    # Duration lines like "דקות 19 שעה 1"
-    if re.match(r"^[א-ת]+\s+\d+\s+[א-ת]+\s+\d+$", l):
+    if "הקורסים שלי" in l or "/יחידות" in l or re.match(r"^Topic \d+$", l):
+        return True
+    # Duration lines like "1 שעה 19 דקות"
+    if re.match(r"^\d+\s+[א-ת]+\s+\d+\s+[א-ת]+$", l):
         return True
     return False
 
@@ -892,13 +974,16 @@ def _parse_huji_review(doc: pymupdf.Document, media_dir: Path) -> ParseResult:
     page0_text = doc[0].get_text() if doc.page_count else ""
     tag, title = _extract_exam_tag(page0_text)
 
-    # Collect (page_num, line_text) for all pages
+    # Collect (page_num, line_text) for all pages. Use _build_text_stream so
+    # Hebrew word order is reading-order (PyMuPDF's get_text("text") returns
+    # spans in physical x-ascending order, which reverses RTL words).
     page_lines: list[tuple[int, str]] = []
     q_num_seq: list[int] = []
     for p in range(doc.page_count):
-        for raw_line in doc[p].get_text("text").split("\n"):
+        page_text, _ = _build_text_stream(doc, p, p + 1, bidi_correct=True)
+        for raw_line in page_text.split("\n"):
             stripped = raw_line.strip()
-            m = re.match(r"^(\d+)\s+שאלה$", stripped)
+            m = re.match(r"^שאלה\s+(\d+)$", stripped)
             if m:
                 q_num_seq.append(int(m.group(1)))
             page_lines.append((p, stripped))
@@ -914,9 +999,11 @@ def _parse_huji_review(doc: pymupdf.Document, media_dir: Path) -> ParseResult:
     for page_num, line in page_lines:
         if _is_huji_metadata(line):
             continue
-        _ans_m = re.search(r":(?:הנכונה התשובה|הן הנכונות(?:\s+התשובות)?)", line)
+        _ans_m = re.match(r"^(?:התשובה הנכונה|התשובות הנכונות הן)\s*:?\s*", line)
         if _ans_m:
-            answer_text = line[: _ans_m.start()].strip()
+            # Bidi reorder may push the trailing colon to the end of the line
+            # when the answer contains an LTR run. Strip a dangling colon.
+            answer_text = re.sub(r"\s*:\s*$", "", line[_ans_m.end():]).strip()
             is_multi = "הנכונות" in _ans_m.group()
             pages_in_block = {pg for pg, _ in current_lines}
             blocks.append(
@@ -957,10 +1044,11 @@ def _parse_huji_review(doc: pymupdf.Document, media_dir: Path) -> ParseResult:
         if block["extra"]:
             answer_text = answer_text + " " + " ".join(block["extra"])
 
-        # Question boundary: last line starting with '?'
+        # Question boundary: last line ending with '?' (bidi-corrected text
+        # places sentence-final punctuation at the line end).
         q_end_idx = -1
         for i, l in enumerate(block_lines):
-            if l.startswith("?"):
+            if l.endswith("?"):
                 q_end_idx = i
         if q_end_idx >= 0:
             q_lines = block_lines[: q_end_idx + 1]
@@ -973,14 +1061,13 @@ def _parse_huji_review(doc: pymupdf.Document, media_dir: Path) -> ParseResult:
 
         # Remove lines that are only a checkmark (PDF layout artifact)
         opt_lines_raw = [l for l in opt_lines_raw if l.replace("", "").replace("", "").strip()]
-        # Merge RTL continuation lines (starting with ')' or '.') into the
-        # preceding option to handle PDF line-wrap artefacts.
+        # Merge obvious wrap-artefact continuation lines into the preceding
+        # option. Conservative: only the clearest cases, since options in
+        # Hebrew exam PDFs rarely end with terminal punctuation and we don't
+        # want to collapse valid options.
         merged_opts: list[str] = []
         for _ol in opt_lines_raw:
-            # Merge only short English suffix continuations like ")Disorder"
-            # Short Hebrew fragments like ")סכיזופרניה" are also continuations
             _paren_cont = _ol.startswith(")") and (len(_ol) < 30 and not _HEB_RE.search(_ol) or len(_ol) < 15)
-            # Merge only very short dot fragments like ".MoCA 9/30"
             _dot_cont = _ol.startswith(".") and len(_ol.replace(".", "").strip()) < 20
             if (_paren_cont or _dot_cont) and merged_opts:
                 merged_opts[-1] = merged_opts[-1] + " " + _ol
@@ -1085,6 +1172,34 @@ def _parse_booklet_question_chunk(
     return question_html, options
 
 
+def _shuffle_booklet_options(
+    options: list[str], exam_tag: str, qnum: int
+) -> tuple[list[str], Optional[int]]:
+    """Shuffle booklet options whose source-index 0 is the correct answer by convention.
+
+    Booklet PDFs (no answer key) list the correct answer first. Setting correct=1
+    blindly would make every Anki card trivial, so we shuffle and return the new
+    1-based position of the originally-first option. The shuffle is seeded by
+    (exam_tag, qnum) so the same PDF re-parses identically across runs.
+    """
+    if not options:
+        return [], None
+    if len(options) == 1:
+        return list(options), 1
+    correct_text = options[0]
+    shuffled = list(options)
+    # str seed is stable across runs; tuple seeds raise TypeError, and a plain
+    # hash() of a tuple is salted unless PYTHONHASHSEED is fixed.
+    rng = random.Random(f"{exam_tag}:{qnum}")
+    rng.shuffle(shuffled)
+    # Guarantee the correct answer never stays at position 1 (the source position),
+    # which would make the shuffle invisible to the learner for that card.
+    if shuffled[0] == correct_text:
+        swap_idx = rng.randint(1, len(shuffled) - 1)
+        shuffled[0], shuffled[swap_idx] = shuffled[swap_idx], shuffled[0]
+    return shuffled, shuffled.index(correct_text) + 1
+
+
 def _parse_exam_booklet(doc: pymupdf.Document, media_dir: Path) -> ParseResult:
     """Parse a single-exam question booklet (`:N שאלה מספר`, no answer key)."""
     media_dir.mkdir(parents=True, exist_ok=True)
@@ -1117,13 +1232,14 @@ def _parse_exam_booklet(doc: pymupdf.Document, media_dir: Path) -> ParseResult:
         q_html, options = _parse_booklet_question_chunk(plain, q_start, q_end, spans)
         if len(options) != 5:
             warnings.append(f"{tag} Q{qnum}: detected {len(options)} options (expected 5)")
+        shuffled_options, correct_idx = _shuffle_booklet_options(options, tag, qnum)
         cards.append(
             Card(
                 exam_tag=tag,
                 number=qnum,
                 question_html=q_html,
-                options=options,
-                correct=None,
+                options=shuffled_options,
+                correct=correct_idx,
                 explanation_html="",
                 question_image=image_map.get((_MARKER_Q, qnum)),
                 source=f"{title}, שאלה {qnum}",
