@@ -882,12 +882,14 @@ def _parse_answer_chunk(
 # ---------- Alternate format detection and parsers ----------
 
 def _detect_format(doc: pymupdf.Document) -> str:
-    """Returns 'huji_review', 'exam_booklet', or 'multi_exam'."""
+    """Returns 'huji_review', 'google_form_exam', 'exam_booklet', or 'multi_exam'."""
     if doc.page_count == 0:
         return "multi_exam"
     page0 = doc[0].get_text()
     if "exam4.cs.huji.ac.il" in page0 or ":הנכונה התשובה" in page0:
         return "huji_review"
+    if "docs.google.com/forms" in page0 or "Switch account" in page0:
+        return "google_form_exam"
     if "שאלה מספר" in page0:
         return "exam_booklet"
     for p in range(1, min(3, doc.page_count)):
@@ -1127,6 +1129,121 @@ def _parse_huji_review(doc: pymupdf.Document, media_dir: Path) -> ParseResult:
     return ParseResult(cards=cards, warnings=warnings, media_dir=str(media_dir), exam_tags=[tag])
 
 
+def _is_google_form_meta(line: str) -> bool:
+    """Filter lines that are Google Forms UI chrome, not exam content."""
+    l = line.strip()
+    if not l:
+        return True
+    if l.startswith("http"):
+        return True
+    if re.match(r"^\d+/\d+$", l):  # page number like "1/21"
+        return True
+    if re.search(r"\d+:\d+\s*,\s*\d+\.\d+\.\d{4}", l):  # timestamp "10:33 ,4.5.2026"
+        return True
+    if "טופס ערעורים" in l:
+        return True
+    if l in ("Clear selection", "Submit", "Clear form", "Not shared", "Switch account", "Forms"):
+        return True
+    if "does this form look suspicious" in l.lower() or l.lower() == "report":
+        return True
+    if "this form was created inside" in l.lower():
+        return True
+    if "@" in l and re.search(r"[^@\s]+@[^@\s]+\.[^@\s]+", l):
+        return True
+    # Lone "ב'" line from split title on page 0
+    if l in ("'ב", "ב'"):
+        return True
+    return False
+
+
+def _parse_google_form_page(page_text: str) -> tuple[list[str], list[str]]:
+    """Parse one page of a Google Forms exam PDF.
+
+    PyMuPDF returns options (left column) before question text (right column).
+    Options are separated by blank lines; question text blocks have NO blank
+    lines between their constituent lines, and always contain '?'.
+
+    Returns (options, questions) where each entry is a plain string.
+    """
+    lines = page_text.split("\n")
+    # Build content blocks: runs of consecutive non-empty lines
+    raw_blocks: list[list[str]] = []
+    current: list[str] = []
+    for raw in lines:
+        s = raw.strip()
+        if s:
+            current.append(s)
+        elif current:
+            raw_blocks.append(current)
+            current = []
+    if current:
+        raw_blocks.append(current)
+
+    # Filter metadata lines and join each block to a single string
+    text_blocks: list[str] = []
+    for block in raw_blocks:
+        content = [l for l in block if not _is_google_form_meta(l)]
+        if content:
+            text_blocks.append(" ".join(content))
+
+    # Merge continuation blocks: a block that ends with '(' but contains no ')'
+    # is an unclosed parenthetical — the closing text is on the next block.
+    merged: list[str] = []
+    for tb in text_blocks:
+        if merged and merged[-1].endswith("(") and ")" not in merged[-1]:
+            merged[-1] = merged[-1] + " " + tb
+        else:
+            merged.append(tb)
+
+    # Classify: anything containing '?' is a question; everything else is an option.
+    # Questions always contain '?'; options are declarative statements.
+    options: list[str] = []
+    questions: list[str] = []
+    for block_text in merged:
+        if "?" in block_text:
+            questions.append(block_text)
+        else:
+            options.append(block_text)
+    return options, questions
+
+
+def _parse_google_form_exam(doc: pymupdf.Document, media_dir: Path) -> ParseResult:
+    """Parse a HUJI Google Forms exam export (no answer key present)."""
+    media_dir.mkdir(parents=True, exist_ok=True)
+    # Use bidi-corrected page 0 so _extract_exam_tag finds year without reversal
+    page0_bidi, _ = _build_text_stream(doc, 0, 1, bidi_correct=True)
+    tag, title = _extract_exam_tag(page0_bidi)
+
+    cards: list[Card] = []
+    warnings: list[str] = []
+    qnum = 0
+    for p in range(doc.page_count):
+        page_text, _ = _build_text_stream(doc, p, p + 1, bidi_correct=True)
+        opts, qs = _parse_google_form_page(page_text)
+        if not qs:
+            continue
+        expected = len(qs) * 5
+        if len(opts) != expected:
+            warnings.append(
+                f"Page {p}: {len(opts)} options for {len(qs)} questions "
+                f"(expected {expected}) — some options may be truncated"
+            )
+        for i, q_text in enumerate(qs):
+            qnum += 1
+            cards.append(
+                Card(
+                    exam_tag=tag,
+                    number=qnum,
+                    question_html=_normalize_html(q_text),
+                    options=opts[i * 5 : (i + 1) * 5],
+                    correct=None,
+                    explanation_html="",
+                    source=f"{title}, שאלה {qnum}",
+                )
+            )
+    return ParseResult(cards=cards, warnings=warnings, media_dir=str(media_dir), exam_tags=[tag])
+
+
 def _parse_booklet_question_chunk(
     plain: str, q_start: int, q_end: int, spans: list[Span]
 ) -> tuple[str, list[str]]:
@@ -1271,6 +1388,11 @@ def parse_pdf(
     if fmt == "huji_review":
         _rpt(0.1, "Parsing HUJI format…")
         result = _parse_huji_review(doc, media_dir)
+        _rpt(1.0, "Done")
+        return result
+    if fmt == "google_form_exam":
+        _rpt(0.1, "Parsing Google Forms exam…")
+        result = _parse_google_form_exam(doc, media_dir)
         _rpt(1.0, "Done")
         return result
     if fmt == "exam_booklet":
