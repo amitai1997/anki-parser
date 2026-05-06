@@ -908,6 +908,8 @@ def _is_huji_metadata(line: str) -> bool:
         return True
     if "נקודות מתוך" in l:
         return True
+    if re.match(r"^\d+$", l):
+        return True
     if re.match(r"^\d+\.\d+$", l):
         return True
     if re.match(r"^\d+/\d+$", l):
@@ -938,7 +940,8 @@ def _heb_letters_only(s: str) -> str:
 
 def _find_correct_option(answer_text: str, options: list[str]) -> Optional[int]:
     def norm(s: str) -> str:
-        return re.sub(r"\s+", " ", html_lib.unescape(s).replace("", "")).strip()
+        s = re.sub(r"\s+", " ", html_lib.unescape(s).replace("", "")).strip()
+        return re.sub(r"\s*-\s*", "-", s)
 
     norm_ans = norm(answer_text)
     norm_opts = [norm(o) for o in options]
@@ -1001,12 +1004,29 @@ def _parse_huji_review(doc: pymupdf.Document, media_dir: Path) -> ParseResult:
     for page_num, line in page_lines:
         if _is_huji_metadata(line):
             continue
-        _ans_m = re.match(r"^(?:התשובה הנכונה|התשובות הנכונות הן)\s*:?\s*", line)
-        if _ans_m:
-            # Bidi reorder may push the trailing colon to the end of the line
-            # when the answer contains an LTR run. Strip a dangling colon.
-            answer_text = re.sub(r"\s*:\s*$", "", line[_ans_m.end():]).strip()
-            is_multi = "הנכונות" in _ans_m.group()
+        # Match answer marker in both word orders (bidi reversal can flip
+        # "התשובה הנכונה" to "הנכונה התשובה") and at line start or end.
+        _ans_m = re.match(
+            r"^(?:התשובה הנכונה|התשובות הנכונות הן|הנכונה התשובה|הן הנכונות התשובות)\s*:?\s*",
+            line,
+        )
+        _ans_rev = None
+        if not _ans_m:
+            _ans_rev = re.search(
+                r":?\s*(?:הנכונה התשובה|הן הנכונות התשובות)(.*?)$", line
+            )
+        if _ans_m or _ans_rev:
+            if _ans_m:
+                # Bidi reorder may push the trailing colon to the end of the line
+                # when the answer contains an LTR run. Strip a dangling colon.
+                answer_text = re.sub(r"\s*:\s*$", "", line[_ans_m.end():]).strip()
+                is_multi = "הנכונות" in _ans_m.group()
+            else:
+                # Marker at line end: "<heb answer>: הנכונה התשובה [ltr tail]"
+                heb_before = line[: _ans_rev.start()].rstrip(": \t")
+                ltr_after = _ans_rev.group(1).strip().rstrip(": ")
+                answer_text = (heb_before + " " + ltr_after).strip() if ltr_after else heb_before
+                is_multi = "הנכונות" in line
             pages_in_block = {pg for pg, _ in current_lines}
             blocks.append(
                 {
@@ -1040,17 +1060,22 @@ def _parse_huji_review(doc: pymupdf.Document, media_dir: Path) -> ParseResult:
     warnings: list[str] = []
 
     for block in blocks:
-        qnum = next(q_num_iter, len(cards) + 1)
         block_lines = block["lines"]
+
+        # Skip blocks with no question (e.g. metadata accumulated before first answer)
+        if not any("?" in l for l in block_lines):
+            continue
+
+        qnum = next(q_num_iter, len(cards) + 1)
         answer_text = block["answer"]
         if block["extra"]:
             answer_text = answer_text + " " + " ".join(block["extra"])
 
-        # Question boundary: last line ending with '?' (bidi-corrected text
-        # places sentence-final punctuation at the line end).
+        # Question boundary: last line containing '?' (bidi-corrected text may
+        # place sentence-final punctuation mid-line when LTR text follows).
         q_end_idx = -1
         for i, l in enumerate(block_lines):
-            if l.endswith("?"):
+            if "?" in l:
                 q_end_idx = i
         if q_end_idx >= 0:
             q_lines = block_lines[: q_end_idx + 1]
@@ -1062,7 +1087,7 @@ def _parse_huji_review(doc: pymupdf.Document, media_dir: Path) -> ParseResult:
 
 
         # Remove lines that are only a checkmark (PDF layout artifact)
-        opt_lines_raw = [l for l in opt_lines_raw if l.replace("", "").replace("", "").strip()]
+        opt_lines_raw = [l for l in opt_lines_raw if l.replace("", "").replace("", "").replace("✓", "").strip()]
         # Merge obvious wrap-artefact continuation lines into the preceding
         # option. Conservative: only the clearest cases, since options in
         # Hebrew exam PDFs rarely end with terminal punctuation and we don't
@@ -1285,6 +1310,33 @@ def _parse_booklet_question_chunk(
         options.append(_spans_to_html(opt_spans))
         # \s*$ in the RE already consumes trailing \n; skip one more for block boundary
         pos_in_chunk = m.end() + 1
+
+    # Fallback: options in blank-line-separated blocks with digit prefix ("1text",
+    # ". 1text") or dot-number suffix ("text .1") — booklets where the marker is
+    # typeset inline. Also handles multi-line questions by rescanning from the
+    # header to find where option 1 begins.
+    if not options:
+        content = section_text[header_m.end():]
+        all_blks = [b.strip() for b in re.split(r"\n{2,}", content) if b.strip()]
+        # Option-1 block: starts with ^\s*\.?\s*1<non-digit> OR ends with .1
+        _OPT1 = re.compile(r"^\s*\.?\s*1(?!\d)|(?<!\d)\.1\s*$")
+        opt1_idx = next((i for i, b in enumerate(all_blks) if _OPT1.search(b)), -1)
+        # Secondary fallback: locate option-2 and treat the preceding block as option-1
+        # (handles bidi-garbled option text where the 1 is embedded mid-string)
+        if opt1_idx < 0:
+            _OPT2 = re.compile(r"^\s*\.?\s*2(?!\d)|(?<!\d)\.2\s*$")
+            opt2_idx = next((i for i, b in enumerate(all_blks) if _OPT2.search(b)), -1)
+            if opt2_idx > 0:
+                opt1_idx = opt2_idx - 1
+        if opt1_idx >= 0:
+            q_blks = all_blks[:opt1_idx]
+            if q_blks:
+                question_html = "<br>".join(html_lib.escape(b) for b in q_blks)
+            for blk in all_blks[opt1_idx : opt1_idx + 6]:
+                cleaned = re.sub(r"^\s*\.?\s*[1-5](?!\d)\s*", "", blk)
+                cleaned = re.sub(r"(?<!\d)\.[1-5]\s*$", "", cleaned).strip()
+                if cleaned:
+                    options.append(html_lib.escape(cleaned))
 
     return question_html, options
 
