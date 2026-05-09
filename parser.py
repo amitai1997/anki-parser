@@ -679,6 +679,37 @@ def _fix_bidi_parens(html: str) -> str:
             i += 1
             continue
 
+        if c == ")" and iso_depth == 0:
+            # Bidi-reversed paren: PyMuPDF extracts some RTL-embedded LTR phrases
+            # in visual order as ")LTR content(" instead of "(LTR content)".
+            # Scan forward for the matching "(" and fix + wrap.
+            j = i + 1
+            matched = False
+            while j < n:
+                cj = html[j]
+                if cj == "<":
+                    end = html.find(">", j)
+                    if end == -1:
+                        break
+                    j = end + 1
+                elif cj == "(":
+                    inner_html = html[i + 1 : j]
+                    inner_text = _strip(inner_html).strip()
+                    if inner_text and not _HEB_RE.search(inner_text):
+                        out.append(f'<span dir="ltr">({inner_html})</span>')
+                        i = j + 1
+                        matched = True
+                    break
+                elif cj in ")\n":
+                    break
+                else:
+                    j += 1
+            if matched:
+                continue
+            out.append(c)
+            i += 1
+            continue
+
         out.append(c)
         i += 1
     return "".join(out)
