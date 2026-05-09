@@ -938,6 +938,7 @@ def _heb_letters_only(s: str) -> str:
     return re.sub(r"[^א-ת\s]", "", s).strip()
 
 
+
 def _find_correct_option(answer_text: str, options: list[str]) -> Optional[int]:
     def norm(s: str) -> str:
         s = re.sub(r"\s+", " ", html_lib.unescape(s).replace("", "")).strip()
@@ -1120,12 +1121,12 @@ def _parse_huji_review(doc: pymupdf.Document, media_dir: Path) -> ParseResult:
         opt_lines_raw = merged_opts
 
         options = [
-            html_lib.escape(l.replace("", "").strip())
+            _fix_bidi_parens(html_lib.escape(l.replace("", "").strip()))
             for l in opt_lines_raw
             if l.strip()
         ]
         q_clean = [
-            html_lib.escape(l.replace("", "").strip())
+            _fix_bidi_parens(html_lib.escape(l.replace("", "").strip()))
             for l in q_lines
             if l.strip()
         ]
