@@ -886,7 +886,7 @@ def _detect_format(doc: pymupdf.Document) -> str:
     if doc.page_count == 0:
         return "multi_exam"
     page0 = doc[0].get_text()
-    if "exam4.cs.huji.ac.il" in page0 or ":הנכונה התשובה" in page0:
+    if "cs.huji.ac.il" in page0 or ":הנכונה התשובה" in page0:
         return "huji_review"
     if "docs.google.com/forms" in page0 or "Switch account" in page0:
         return "google_form_exam"
@@ -902,7 +902,7 @@ def _is_huji_metadata(line: str) -> bool:
     l = line.strip()
     if not l:
         return True
-    if re.match(r"^שאלה\s+\d+$", l):
+    if re.match(r"^שאלה\s*\d+$", l):
         return True
     if l in ("תקין", "שגוי", "לענות", "מצב", "הסתיים", "/"):
         return True
@@ -924,7 +924,7 @@ def _is_huji_metadata(line: str) -> bool:
         return True
     if "ציונים" in l or "ציון מירבי" in l:
         return True
-    if "הזמן שלקח" in l or "סקירת ניסיון" in l:
+    if "הזמן שלקח" in l or "סקירת ניסיון" in l or "Attempt review" in l or "review Attempt" in l:
         return True
     if "הקורסים שלי" in l or "/יחידות" in l or re.match(r"^Topic \d+$", l):
         return True
@@ -958,6 +958,23 @@ def _find_correct_option(answer_text: str, options: list[str]) -> Optional[int]:
             h_o = _heb_letters_only(o)
             if h_o and (h_ans in h_o or h_o in h_ans):
                 return i + 1
+    # Bidi correction can reverse word order in LTR (English) runs; try reversed.
+    # Also try with parentheses stripped since bidi can mis-place mirror chars.
+    def _strip_parens(s: str) -> str:
+        return re.sub(r"\s+", " ", re.sub(r"[()]", "", s)).strip()
+
+    words = norm_ans.split()
+    if len(words) > 1:
+        rev_ans = " ".join(words[::-1])
+        for i, o in enumerate(norm_opts):
+            if rev_ans == o or rev_ans in o or o in rev_ans:
+                return i + 1
+        rev_np = _strip_parens(rev_ans)
+        if rev_np:
+            for i, o in enumerate(norm_opts):
+                o_np = _strip_parens(o)
+                if o_np and (rev_np == o_np or rev_np in o_np or o_np in rev_np):
+                    return i + 1
     return None
 
 
@@ -988,7 +1005,7 @@ def _parse_huji_review(doc: pymupdf.Document, media_dir: Path) -> ParseResult:
         page_text, _ = _build_text_stream(doc, p, p + 1, bidi_correct=True)
         for raw_line in page_text.split("\n"):
             stripped = raw_line.strip()
-            m = re.match(r"^שאלה\s+(\d+)$", stripped)
+            m = re.match(r"^שאלה\s*(\d+)$", stripped)
             if m:
                 q_num_seq.append(int(m.group(1)))
             page_lines.append((p, stripped))
